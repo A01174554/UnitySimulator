@@ -1,0 +1,282 @@
+import agentpy as ap
+import random
+import matplotlib.pyplot as plt
+import math
+import json
+import requests
+from collections import deque
+
+
+"""
+Authors:
+- Lucas Mateo Tapia Callisperis
+- Emiliano Enríquez López
+- Emiliano Altamirano Báez
+- Rafael Cárdenas Meneses
+- ChatGPT (Assistant & Debugging/Optimization Support)
+"""
+
+url = "https://10.22.227.119:7162/Json/postjson"
+
+class TrashTruck(ap.Agent):
+    def setup(self):
+        self.position = self.random_free_position()
+        self.load = 0
+        self.bins_picked_up = 0
+        self.isActive = False
+        self.max_load = self.model.p["truck_capacity"]
+        self.target_bin = None
+
+    def bfs_path(self, start, goal):
+        """Return shortest path (as list of positions) from start to goal using BFS."""
+        grid = self.model.p["grid_map"]
+        rows, cols = len(grid), len(grid[0])
+
+        queue = deque([start])
+        visited = {start: None}  # store parent of each visited cell
+
+        while queue:
+            x, y = queue.popleft()
+            if (x, y) == goal:
+                # reconstruct path
+                path = []
+                cur = (x, y)
+                while cur is not None:
+                    path.append(cur)
+                    cur = visited[cur]
+                return path[::-1]  # reverse path
+            # explore neighbors
+            for nx, ny in [(x+1,y),(x-1,y),(x,y+1),(x,y-1)]:
+                if (0 <= nx < rows and 0 <= ny < cols 
+                    and grid[nx][ny] != 1  # not a wall
+                    and (nx, ny) not in visited):
+                    visited[(nx, ny)] = (x, y)
+                    queue.append((nx, ny))
+        return None  # no path
+
+
+    def random_free_position(self):
+        grid = self.model.p["grid_map"]
+        free_cells = [(i, j) for i in range(len(grid))
+                      for j in range(len(grid[0])) if grid[i][j] == 0]
+        return random.choice(free_cells)
+
+    def move_toward(self, target_pos):
+        path = self.bfs_path(self.position, target_pos)
+        if path and len(path) > 1:
+            # step to the next cell along the shortest path
+            self.position = path[1]
+
+    def at_position(self, target):
+        return self.position == target
+
+    def distance_to(self, target):
+        return math.dist(self.position, target)
+
+
+class TrashBin(ap.Agent):
+    def setup(self):
+        self.position = self.random_free_position()
+        self.status = 0
+        self.max_trash = self.model.p["bin_capacity"]
+        self.assigned = False
+
+    def random_free_position(self):
+        grid = self.model.p["grid_map"]
+        free_cells = [(i, j) for i in range(len(grid))
+                      for j in range(len(grid[0])) if grid[i][j] == 0]
+        return random.choice(free_cells)
+
+
+class CommunicationModel(ap.Model):
+    def setup(self):
+        self.step_count = 0
+        self.trucks = ap.AgentList(self, self.p["trucks"], TrashTruck)
+        self.bins = ap.AgentList(self, self.p["bins"], TrashBin)
+        self.agents = self.trucks + self.bins
+        self.log = {"steps": []}
+
+    def step(self):
+
+        for bin in self.bins:
+            if bin.status == 0 and random.random() < 0.1 and not bin.assigned:
+                bin.status = 1
+                bin.assigned = False
+
+        unassigned_bins = [b for b in self.bins if b.status == 1 and not b.assigned]
+        for bin in unassigned_bins:
+            eligible_trucks = [
+                t for t in self.trucks if (t.max_load - t.load) >= bin.max_trash and not t.isActive
+            ]
+            if not eligible_trucks:
+                continue
+
+            eligible_trucks.sort(key=lambda t: (t.distance_to(bin.position), t.load))
+
+            selected_truck = eligible_trucks[0]
+            selected_truck.target_bin = bin
+            selected_truck.isActive = True
+            bin.assigned = True
+
+        for truck in self.trucks:
+            if truck.target_bin is None or not truck.isActive:
+                unassigned_bins = [b for b in self.bins if b.status == 1 and not b.assigned]
+                if unassigned_bins:
+                    unassigned_bins.sort(key=lambda b: truck.distance_to(b.position))
+                    target = unassigned_bins[0]
+                    truck.target_bin = target
+                    truck.isActive = True
+                    target.assigned = True
+
+            if truck.isActive and truck.target_bin:
+                if not truck.at_position(truck.target_bin.position):
+                    truck.move_toward(truck.target_bin.position)
+                else:
+                    truck.load += truck.target_bin.max_trash
+                    truck.bins_picked_up += 1
+                    truck.target_bin.status = 0
+                    truck.target_bin.assigned = False
+                    truck.isActive = False
+                    truck.target_bin = None
+
+    def update(self):
+        self.step_count += 1
+        self.plot_state()
+
+        step_data = {"step": self.step_count, "agents": {}}
+
+        for i, truck in enumerate(self.trucks):
+            step_data["agents"][f"truck_{i}"] = {
+                "type": "truck",
+                "position": list(truck.position),
+                "load": truck.load,
+                "isActive": truck.isActive,
+            }
+
+        for i, bin in enumerate(self.bins):
+            step_data["agents"][f"bin_{i}"] = {
+                "type": "bin",
+                "position": list(bin.position),
+                "status": bin.status,
+                "assigned": bin.assigned,
+            }
+
+        self.log["steps"].append(step_data)
+
+    def get_grid_state(self):
+        """Return a grid with trucks (2) and bins (3) marked on it."""
+        base = [row[:] for row in self.p["grid_map"]]
+
+        for bin in self.bins:
+            x, y = bin.position
+            if bin.status == 1:
+                base[x][y] = 3
+
+        for truck in self.trucks:
+            x, y = truck.position
+            base[x][y] = 2
+
+        return base
+    
+    def print_grid(self):
+        display_grid = [row[:] for row in self.model.p["grid_map"]]
+
+        for bin in self.bins:
+            x, y = bin.position
+            display_grid[x][y] = 3
+
+        for truck in self.trucks:
+            x, y = truck.position
+            display_grid[x][y] = 2
+
+        for row in display_grid:
+            print(" ".join(str(cell) for cell in row))
+        print("\n" + "-"*40 + "\n")
+
+    def plot_state(self):
+        plt.figure(figsize=(6, 6))
+        plt.title(f"Step {self.step_count}")
+
+        grid = self.get_grid_state()
+        colors = {0: "white", 1: "black", 2: "blue", 3: "red"}
+
+        for i in range(len(grid)):
+            for j in range(len(grid[0])):
+                val = grid[i][j]
+                plt.scatter(j, i, c=colors[val], marker="s", s=100)
+
+        plt.xlim(-1, len(grid[0]))
+        plt.ylim(-1, len(grid))
+        plt.gca().invert_yaxis()
+        plt.grid(True)
+        plt.show()
+
+
+    def end(self):
+        print("Simulation ended.")
+        for truck in self.trucks:
+            print(
+                f"Truck at {truck.position} has load {truck.load} and has picked up {truck.bins_picked_up} bins"
+            )
+
+def save_log_to_json(model, filename="simulation_log.json"):
+    """
+    Save the simulation log (all steps) to a JSON file.
+    """
+    # Build a structured JSON
+    output = {
+        "parameters": model.p,
+        "steps": model.log["steps"]
+    }
+
+    # Save to file
+    with open(filename, "w") as f:
+        json.dump(output, f, indent=4)
+
+def send_log_to_api(model,url):
+    output = {
+        "parameters": model.p,
+        "steps": model.log["steps"]
+    }
+    try:
+        with open("simulation_log.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+        response = requests.post(url,json=output, verify=False)
+        response.raise_for_status()
+        print(f"Log enviado a la api: {response.status_code}")
+        print(response.text)
+    except requests.exceptions.RequestException as e:
+        print(f"error enviar a la api {e}")
+def main():
+    parameters = {
+        "trucks": 2,
+        "bins": 5,
+        "steps": 50,
+        "truck_capacity": 1000,
+        "bin_capacity": 100,
+        "grid_map": [
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], #0
+            [0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1], #1
+            [0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1], #2
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], #3
+            [0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0], #4
+            [0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0], #5
+            [0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0], #6
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], #7
+            [0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0], #8
+            [0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0], #9
+            [0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0], #10
+            [0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0], #11
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], #12
+        ],
+    }
+
+    model = CommunicationModel(parameters)
+    results = model.run()
+    save_log_to_json(model, "simulation_log.json")
+    send_log_to_api(model,url)
+    print(results)
+
+
+if __name__ == "__main__":
+    main()
